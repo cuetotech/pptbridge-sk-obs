@@ -1,0 +1,196 @@
+name: Windows Operator Dock - Experimental Installer
+on:
+  push:
+    branches: [feat/windows-operator-dock]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: operator-dock-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  integrate:
+    if: github.repository == 'cuetotech/pptbridge-sk-obs' && github.ref == 'refs/heads/feat/windows-operator-dock'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Apply reviewed integration edits and run navigation model tests
+        run: |
+          set -euo pipefail
+          python3 native-plugin/scripts/integrate-operator-dock.py
+          g++ -std=c++17 -Wall -Wextra -Werror -pthread -I native-plugin/src native-plugin/tests/operator_model_test.cpp -o /tmp/operator-model
+          /tmp/operator-model
+          git diff --check
+      - name: Commit integration before compiling immutable source
+        id: source
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A native-plugin
+          if ! git diff --cached --quiet; then
+            git commit -m 'Windows: integrate operator dock, read-only assets and command-state guards'
+            git push origin HEAD:refs/heads/feat/windows-operator-dock
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+  build:
+    needs: integrate
+    runs-on: windows-2022
+    timeout-minutes: 40
+    env:
+      OBS_VERSION: 32.2.2
+      PACKAGE_NAME: pptbridge-operator-dock-windows-x64-test
+      SOURCE_SHA: ${{ needs.integrate.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.integrate.outputs.source_sha }}
+          persist-credentials: false
+      - name: Verify feature and immutable source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ((git rev-parse HEAD) -ne $env:SOURCE_SHA) { throw 'Unexpected source revision' }
+          foreach ($check in @(
+            @('native-plugin/src/source_slide_win.cpp','live_held_frame'),
+            @('native-plugin/src/plugin-main.cpp','RegisterOperatorDock'),
+            @('native-plugin/src/presentation_document_win.cpp','OperatorSnapshot'),
+            @('native-plugin/CMakeLists.txt','src/operator_dock.cpp')
+          )) {
+            if (-not (Select-String -LiteralPath $check[0] -SimpleMatch $check[1] -Quiet)) { throw "Missing feature: $($check[1])" }
+          }
+      - name: Download official matching OBS and Qt development files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Join-Path $env:RUNNER_TEMP 'obs.zip'
+          curl.exe -fL --retry 3 -o $zip "https://github.com/obsproject/obs-studio/releases/download/$env:OBS_VERSION/OBS-Studio-$env:OBS_VERSION-Windows-x64.zip"
+          if ($LASTEXITCODE -ne 0) { throw 'OBS download failed' }
+          $dest = Join-Path $env:RUNNER_TEMP 'obs'
+          Expand-Archive -LiteralPath $zip -DestinationPath $dest
+          $dll = Get-ChildItem $dest -Filter obs.dll -Recurse | Where-Object { $_.FullName -match '[\\/]bin[\\/]64bit[\\/]' } | Select-Object -First 1
+          if (-not $dll) { throw 'Missing official obs.dll' }
+          $obsRoot = Split-Path -Parent (Split-Path -Parent $dll.Directory.FullName)
+          "OBS_APP_DIR=$obsRoot" >> $env:GITHUB_ENV
+          $src = Join-Path $env:RUNNER_TEMP 'obs-headers'
+          git clone --depth 1 --branch $env:OBS_VERSION --filter=blob:none --sparse https://github.com/obsproject/obs-studio.git $src
+          if ($LASTEXITCODE -ne 0) { throw 'OBS headers checkout failed' }
+          git -C $src sparse-checkout set libobs frontend/api
+          if ($LASTEXITCODE -ne 0) { throw 'OBS sparse checkout failed' }
+          "OBS_SOURCE_DIR=$src" >> $env:GITHUB_ENV
+          $qtZip = Join-Path $env:RUNNER_TEMP 'qt.zip'
+          curl.exe -fL --retry 3 -o $qtZip 'https://github.com/obsproject/obs-deps/releases/download/2026-07-15/windows-deps-qt6-2026-07-15-x64.zip'
+          if ($LASTEXITCODE -ne 0) { throw 'Qt SDK download failed' }
+          $qtHash = '7c7f985711d80467bdc1795b6592275a27d5b0e5a2c7a61db1f2c1d08d6a5579'
+          if ((Get-FileHash $qtZip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $qtHash) { throw 'Qt SDK SHA256 mismatch' }
+          $qtDir = Join-Path $env:RUNNER_TEMP 'qt-sdk'
+          Expand-Archive -LiteralPath $qtZip -DestinationPath $qtDir
+          $config = Get-ChildItem $qtDir -Recurse -Filter Qt6Config.cmake | Select-Object -First 1
+          if (-not $config) { throw 'Qt6Config.cmake missing' }
+          $qtRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $config.Directory.FullName))
+          "QT_ROOT=$qtRoot" >> $env:GITHUB_ENV
+          "QT_CONFIG=$($config.Directory.FullName)" >> $env:GITHUB_ENV
+      - name: Generate OBS import libraries from official DLLs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -property installationPath
+          $toolDir = Get-ChildItem (Join-Path $vs 'VC\Tools\MSVC') -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          $dumpbin = Join-Path $toolDir.FullName 'bin\Hostx64\x64\dumpbin.exe'
+          $lib = Join-Path $toolDir.FullName 'bin\Hostx64\x64\lib.exe'
+          $out = Join-Path $env:OBS_APP_DIR 'lib'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          foreach ($name in @('obs','obs-frontend-api')) {
+            $exports = & $dumpbin /exports (Join-Path $env:OBS_APP_DIR "bin\64bit\$name.dll")
+            if ($LASTEXITCODE -ne 0) { throw "Export inspection failed: $name" }
+            $symbols = @($exports | ForEach-Object { if ($_ -match '^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]{8}\s+(\S+)') { $Matches[1] } } | Sort-Object -Unique)
+            if ($symbols.Count -lt 10) { throw "Invalid export list: $name" }
+            $def = Join-Path $out "$name.def"
+            @("LIBRARY $name.dll",'EXPORTS') + $symbols | Set-Content $def -Encoding ascii
+            & $lib /nologo "/def:$def" /machine:x64 "/out:$out\$name.lib"
+            if ($LASTEXITCODE -ne 0) { throw "Import library failed: $name" }
+          }
+          "OBS_LIBRARY_DIR=$out" >> $env:GITHUB_ENV
+      - name: Compile Windows plugin and Qt test application
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S native-plugin -B native-plugin/build-operator -G 'Visual Studio 17 2022' -A x64 "-DOBS_SOURCE_DIR=$env:OBS_SOURCE_DIR" "-DOBS_APP_DIR=$env:OBS_APP_DIR" "-DOBS_LIBRARY_DIR=$env:OBS_LIBRARY_DIR" "-DCMAKE_PREFIX_PATH=$env:QT_ROOT" "-DQt6_DIR=$env:QT_CONFIG" "-DPPTBRIDGE_BUILD_ID=$env:SOURCE_SHA" -DBUILD_TESTING=ON
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed' }
+          cmake --build native-plugin/build-operator --config Release --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw 'Compile/link failed' }
+      - name: Run navigation and real Qt interaction tests with fake presentation backend
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PATH = "$env:QT_ROOT\bin;$env:OBS_APP_DIR\bin\64bit;$env:PATH"
+          $env:QT_PLUGIN_PATH = "$env:QT_ROOT\plugins"
+          ctest --test-dir native-plugin/build-operator -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { throw 'Operator tests failed' }
+      - name: Package experimental installer and verify installation into a fixture
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP $env:PACKAGE_NAME
+          New-Item -ItemType Directory -Force "$stage\obs-plugins\64bit","$stage\data\obs-plugins\pptbridge-obs" | Out-Null
+          Copy-Item native-plugin/build-operator/bundle/Release/pptbridge-obs.dll "$stage\obs-plugins\64bit\pptbridge-obs.dll"
+          Copy-Item native-plugin/windows-package/INSTALL.cmd "$stage\INSTALL.cmd"
+          Get-ChildItem native-plugin/data | Copy-Item -Destination "$stage\data\obs-plugins\pptbridge-obs" -Recurse
+          Copy-Item native-plugin/OPERATOR-DOCK.md "$stage\README.txt"
+          Copy-Item native-plugin/LICENSE "$stage\LICENSE.txt"
+          @("EXPERIMENTAL Operator Dock v1", "Source: $env:SOURCE_SHA", "OBS SDK: $env:OBS_VERSION", "Qt SDK: OBS official 2026-07-15 x64", "PowerPoint / real OBS runtime acceptance: NOT PERFORMED in CI", "Source: https://github.com/cuetotech/pptbridge-sk-obs/tree/$env:SOURCE_SHA") | Set-Content "$stage\BUILD-INFO.txt"
+          $mock = Join-Path $env:RUNNER_TEMP 'installer-fixture'
+          New-Item -ItemType Directory -Force "$mock\bin\64bit","$mock\obs-plugins\64bit" | Out-Null
+          Set-Content "$mock\bin\64bit\obs64.exe" 'fixture only - not an OBS executable'
+          Set-Content "$mock\obs-plugins\64bit\pptbridge-obs.dll" 'previous plugin fixture'
+          & "$stage\INSTALL.cmd" $mock --no-pause
+          if ($LASTEXITCODE -ne 0) { throw 'Installer fixture failed' }
+          $expected = (Get-FileHash "$stage\obs-plugins\64bit\pptbridge-obs.dll").Hash
+          if ((Get-FileHash "$mock\obs-plugins\64bit\pptbridge-obs.dll").Hash -ne $expected) { throw 'Installed DLL hash mismatch' }
+          # A locked existing DLL must fail without modifying the working DLL.
+          $lock = [IO.File]::Open("$mock\obs-plugins\64bit\pptbridge-obs.dll",'Open','Read','None')
+          try {
+            & "$stage\INSTALL.cmd" $mock --no-pause
+            $lockedExit = $LASTEXITCODE
+          } finally { $lock.Dispose() }
+          if ($lockedExit -eq 0) { throw 'Installer did not fail on a locked DLL' }
+          if ((Get-FileHash "$mock\obs-plugins\64bit\pptbridge-obs.dll").Hash -ne $expected) { throw 'Locked-install rollback changed DLL' }
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          $zip = Join-Path (Resolve-Path artifacts) "$env:PACKAGE_NAME.zip"
+          Compress-Archive -Path "$stage\*" -DestinationPath $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $env:PACKAGE_NAME.zip" | Set-Content "$zip.sha256" -Encoding ascii
+          "PACKAGE_DIR=$stage" >> $env:GITHUB_ENV
+          @("## Operator dock build", "Source commit: $env:SOURCE_SHA", "Compile, model tests, Qt interaction tests and installer fixture passed.", "PowerPoint/OBS runtime rehearsal remains required.") >> $env:GITHUB_STEP_SUMMARY
+      - name: Upload installer (extract and run INSTALL.cmd)
+        uses: actions/upload-artifact@v4
+        with:
+          name: pptbridge-operator-dock-windows-x64-test
+          path: ${{ env.PACKAGE_DIR }}/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload ZIP and checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: pptbridge-operator-dock-zip-sha256
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: operator-dock-test-evidence
+          path: |
+            native-plugin/build-operator/Testing/Temporary/LastTest.log
+            native-plugin/build-operator/operator-panel-smoke.png
+          if-no-files-found: warn
+          retention-days: 30

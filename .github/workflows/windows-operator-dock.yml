@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: write
+      contents: read
     outputs:
       source_sha: ${{ steps.source.outputs.sha }}
     steps:
@@ -28,16 +28,14 @@ jobs:
           g++ -std=c++17 -Wall -Wextra -Werror -pthread -I native-plugin/src native-plugin/tests/operator_model_test.cpp -o /tmp/operator-model
           /tmp/operator-model
           git diff --check
-      - name: Commit integration before compiling immutable source
+      - name: Verify integration is committed before compiling immutable source
         id: source
         run: |
           set -euo pipefail
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -A native-plugin
-          if ! git diff --cached --quiet; then
-            git commit -m 'Windows: harden operator asset generations and command lifetime'
-            git push origin HEAD:refs/heads/feat/windows-operator-dock
+          if [[ -n "$(git status --porcelain --untracked-files=all -- native-plugin)" ]]; then
+            git status --short --untracked-files=all -- native-plugin
+            echo "::error::The integration script changed source files. Commit those edits to the feature branch before building so the check and artifact identify the same immutable commit."
+            exit 1
           fi
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
   build:

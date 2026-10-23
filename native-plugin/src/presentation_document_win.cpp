@@ -3155,7 +3155,7 @@ void PresentationDocument::RunLivePowerPointCommandAsync(
   }
 
   auto self = shared_from_this();
-  auto ticket = std::make_shared<OperatorCommandTicket>(operator_navigation_inflight_);
+  auto ticket = std::make_shared<OperatorCommandTicket>(operator_navigation_inflight_, self);
   std::thread([self, ticket, mode, target_slide, request_generation]() {
     std::string output;
     int exit_code = -1;
@@ -3405,7 +3405,8 @@ OperatorDeck PresentationDocument::OperatorSnapshot() const
   OperatorDeck deck;
   deck.name = impl_->name;
   deck.path = impl_->path;
-  deck.identity = impl_->path + "#" + std::to_string(operator_assets_generation_.load());
+  deck.identity = impl_->path + "#" + std::to_string(operator_instance_id_) + ":" +
+    std::to_string(operator_assets_generation_.load());
   deck.loading = impl_->loading;
   deck.valid = impl_->loaded && !impl_->slides.empty();
   deck.busy = operator_navigation_inflight_.load(std::memory_order_relaxed) != 0;
@@ -4093,6 +4094,9 @@ void PresentationDocument::LoadOnWorker()
     std::lock_guard<std::mutex> render_lock(impl_->render_mutex);
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (prepared_new_deck) {
+      // Also invalidate on publication: reloading can replace assets without
+      // changing the slide count, while the old snapshot was visible at start.
+      operator_assets_generation_.fetch_add(1, std::memory_order_relaxed);
       impl_->slides = std::move(deck_data.slides);
       impl_->media_by_slide = std::move(deck_data.media_by_slide);
       if (deck_data.slide_aspect_ratio >= 0.2 && deck_data.slide_aspect_ratio <= 10.0) {

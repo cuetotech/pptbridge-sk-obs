@@ -4,10 +4,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <memory>
+#include <utility>
 #include <string>
 #include <vector>
 
 namespace pptbridge {
+
+inline std::atomic<uint64_t> operator_next_instance_id{1};
 
 struct OperatorSlide {
   std::string title;
@@ -95,13 +99,17 @@ private:
 // Destruction also handles an exception while constructing its worker thread.
 class OperatorCommandTicket {
 public:
-  explicit OperatorCommandTicket(std::atomic<unsigned> &counter) : counter_(counter)
+  explicit OperatorCommandTicket(std::atomic<unsigned> &counter, std::shared_ptr<void> owner = {})
+    : counter_(counter), owner_(std::move(owner))
   { counter_.fetch_add(1, std::memory_order_relaxed); }
   ~OperatorCommandTicket() { counter_.fetch_sub(1, std::memory_order_relaxed); }
   OperatorCommandTicket(const OperatorCommandTicket &) = delete;
   OperatorCommandTicket &operator=(const OperatorCommandTicket &) = delete;
 private:
   std::atomic<unsigned> &counter_;
+  // Keep the containing document alive through the destructor's decrement,
+  // independent of the worker closure's capture destruction order.
+  std::shared_ptr<void> owner_;
 };
 
 inline bool OperatorCanNavigate(const OperatorDeck &deck)

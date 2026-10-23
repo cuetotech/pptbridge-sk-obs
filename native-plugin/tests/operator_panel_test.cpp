@@ -13,7 +13,7 @@
 using namespace pptbridge;
 int checks = 0;
 void require(bool value, const char *message)
-{ ++checks; if (!value) throw std::runtime_error(message); }
+{ ++checks; std::cerr << "Check " << checks << ": " << message << std::endl; if (!value) throw std::runtime_error(message); }
 struct Fake final : OperatorBackend {
   OperatorDeck deck;
   int commands = 0;
@@ -40,7 +40,9 @@ template <class T> T *find(OperatorPanel &panel, const char *name)
 { auto *result = panel.findChild<T *>(name); if (!result) throw std::runtime_error(name); return result; }
 int main(int argc, char **argv)
 {
+  std::cerr << "Starting Qt panel test" << std::endl;
   QApplication app(argc, argv);
+  std::cerr << "Qt application initialized" << std::endl;
   try {
     QTemporaryDir assets;
     QImage image(640, 360, QImage::Format_RGB32);
@@ -55,7 +57,7 @@ int main(int argc, char **argv)
     backend->deck.valid = true;
     backend->deck.capture_status = "Cached test fixture (not live capture)";
     backend->deck.slides = {{"Verse one", "Opening notes", path.toUtf8().toStdString()},
-      {"Verse two", "Repeat here", path.toUtf8().toStdString()},
+      {u8"Verse two \uC740\uD61C", "Repeat here", path.toUtf8().toStdString()},
       {"Ending", "", path.toUtf8().toStdString()}};
     OperatorPanel panel(std::move(fake));
     panel.resize(760, 1000); panel.show(); app.processEvents();
@@ -69,6 +71,9 @@ int main(int argc, char **argv)
     require(!show->isEnabled() && sources->currentIndex() == 0, "explicit source choice required");
     sources->setCurrentIndex(1); panel.Refresh();
     require(grid->count() == 3 && show->isEnabled(), "deck loaded into panel");
+    search->setText(QString::fromUtf8(u8"\uC740\uD61C"));
+    require(grid->item(0)->isHidden() && !grid->item(1)->isHidden(), "Korean title search");
+    search->clear();
     grid->setCurrentRow(1);
     require(backend->commands == 0 && backend->deck.current == 0, "thumbnail browsing has no command");
     panel.Refresh();

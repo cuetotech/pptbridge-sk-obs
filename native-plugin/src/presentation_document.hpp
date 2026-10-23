@@ -178,6 +178,7 @@ private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 #ifdef _WIN32
+  const uint64_t operator_instance_id_ = operator_next_instance_id.fetch_add(1);
   std::atomic<unsigned> operator_navigation_inflight_{0};
   std::atomic<uint64_t> operator_assets_generation_{0};
 #endif

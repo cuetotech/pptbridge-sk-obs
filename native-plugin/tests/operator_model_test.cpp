@@ -52,6 +52,13 @@ int main()
     { OperatorCommandTicket a(counter); OperatorCommandTicket b(counter);
       require(counter == 2, "tickets track concurrent commands"); }
     require(counter == 0, "tickets release commands");
+    auto owner = std::make_shared<std::atomic<unsigned>>(0);
+    std::weak_ptr<std::atomic<unsigned>> weak = owner;
+    auto ticket = std::make_unique<OperatorCommandTicket>(*owner, owner);
+    owner.reset();
+    require(!weak.expired(), "ticket retains the document counter owner");
+    ticket.reset();
+    require(weak.expired(), "owner is released after ticket destruction");
     std::cout << checks << " model checks passed\n";
     return 0;
   } catch (const std::exception &e) { std::cerr << e.what() << '\n'; return 1; }

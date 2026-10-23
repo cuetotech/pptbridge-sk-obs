@@ -56,6 +56,16 @@ struct SourceContext {
   gs_texture_t *texture = nullptr;
   uint32_t texture_width = 0;
   uint32_t texture_height = 0;
+#ifdef _WIN32
+  // Windows live capture's last successful frame. Never substitute an
+  // unrelated cached first slide during a short capture reattachment.
+  gs_texrender_t *live_held_frame = nullptr;
+  gs_texrender_t *live_staging_frame = nullptr;
+  bool live_held_frame_valid = false;
+  bool live_fallback_reported = false;
+  std::chrono::steady_clock::time_point live_held_frame_at =
+    std::chrono::steady_clock::time_point::min();
+#endif
   std::vector<uint8_t> pixels;
   uint32_t stride = 0;
   uint64_t rendered_state_version = 0;

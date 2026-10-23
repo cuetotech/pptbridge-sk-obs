@@ -3155,7 +3155,8 @@ void PresentationDocument::RunLivePowerPointCommandAsync(
   }
 
   auto self = shared_from_this();
-  std::thread([self, mode, target_slide, request_generation]() {
+  auto ticket = std::make_shared<OperatorCommandTicket>(operator_navigation_inflight_);
+  std::thread([self, ticket, mode, target_slide, request_generation]() {
     std::string output;
     int exit_code = -1;
     LiveSnapshot snapshot;
@@ -3396,6 +3397,30 @@ PresentationStatus PresentationDocument::SnapshotStatus() const
   }
 
   return status;
+}
+
+OperatorDeck PresentationDocument::OperatorSnapshot() const
+{
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  OperatorDeck deck;
+  deck.name = impl_->name;
+  deck.path = impl_->path;
+  deck.identity = impl_->path + "#" + std::to_string(operator_assets_generation_.load());
+  deck.loading = impl_->loading;
+  deck.valid = impl_->loaded && !impl_->slides.empty();
+  deck.busy = operator_navigation_inflight_.load(std::memory_order_relaxed) != 0;
+  deck.live_enabled = impl_->live_enabled;
+  deck.live_ready = impl_->live_ready;
+  deck.black = impl_->black_screen;
+  deck.error = impl_->last_error;
+  deck.current = impl_->slides.empty() ? 0 : std::min(impl_->current_index, impl_->slides.size() - 1);
+  deck.slides.reserve(impl_->slides.size());
+  for (std::size_t index = 0; index < impl_->slides.size(); ++index) {
+    const auto &slide = impl_->slides[index];
+    deck.slides.push_back({CueTitleForSlide(impl_->slides, index),
+                          slide.meta.notes, WideToUtf8(slide.image_path)});
+  }
+  return deck;
 }
 
 bool PresentationDocument::SetCueChecked(std::size_t index, bool checked)
@@ -3880,6 +3905,7 @@ void PresentationDocument::StartLoadIfNeeded(bool force_reload)
     }
 
     impl_->loading = true;
+    operator_assets_generation_.fetch_add(1, std::memory_order_relaxed);
     impl_->load_requested = false;
     impl_->active_force_reload = impl_->force_reload;
     impl_->force_reload = false;

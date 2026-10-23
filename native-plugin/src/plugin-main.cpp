@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "presentation_document.hpp"
+#include "operator_dock.hpp"
 #include "pptbridge_osc_server.hpp"
 #include "pptbridge_registry.hpp"
 
@@ -249,7 +250,7 @@ void hotkey_router(void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed)
   if (!pressed || !data) {
     return;
   }
-  if (!obs_application_is_active()) {
+  if (!obs_application_is_active() || pptbridge::OperatorDockHasFocus()) {
     return;
   }
 
@@ -876,6 +877,10 @@ void frontend_event_callback(enum obs_frontend_event event, void *)
   if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING) {
     apply_default_hotkeys_if_needed();
     load_osc_settings_from_config();
+    pptbridge::RegisterOperatorDock();
+  }
+  if (event == OBS_FRONTEND_EVENT_EXIT) {
+    pptbridge::UnregisterOperatorDock();
   }
 }
 
@@ -927,6 +932,7 @@ bool obs_module_load(void)
 
 void obs_module_unload(void)
 {
+  pptbridge::UnregisterOperatorDock();
   set_clicker_capture_enabled(false);
   set_osc_enabled(false);
   obs_frontend_remove_event_callback(frontend_event_callback, nullptr);

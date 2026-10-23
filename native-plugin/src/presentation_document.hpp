@@ -1,6 +1,9 @@
 #pragma once
 
 #include <cstddef>
+#ifdef _WIN32
+#include "operator_model.hpp"
+#endif
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -148,6 +151,9 @@ public:
   uint64_t PresentationSeconds() const;
   std::vector<EmbeddedMedia> CurrentMedia() const;
   PresentationStatus SnapshotStatus() const;
+#ifdef _WIN32
+  OperatorDeck OperatorSnapshot() const;
+#endif
   bool SetCueChecked(std::size_t index, bool checked);
   bool ToggleCueChecked(std::size_t index);
   void ClearCueChecks();
@@ -171,6 +177,10 @@ public:
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+#ifdef _WIN32
+  std::atomic<unsigned> operator_navigation_inflight_{0};
+  std::atomic<uint64_t> operator_assets_generation_{0};
+#endif
 
   void StartLoadIfNeeded(bool force_reload);
   void LoadOnWorker();

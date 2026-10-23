@@ -2587,6 +2587,10 @@ void reset_live_child_sources(SourceContext *context, bool suppress_auto_recover
   context->live_capture_suppressed_after_stop = suppress_auto_recovery;
   if (suppress_auto_recovery) {
     context->started_live_powerpoint_from_this_source = false;
+    // An explicit operator stop must release the visual hold immediately.
+    std::lock_guard<std::mutex> render_lock(context->render_state_mutex);
+    context->live_held_frame_valid = false;
+    context->live_fallback_reported = false;
   }
 }
 
@@ -3140,6 +3144,11 @@ void source_update(SourceContext *context, obs_data_t *settings)
     context->height = height;
     context->live_capture_resize_mode = live_capture_resize_mode;
     context->presenter_options = presenter_options;
+    if (path_changed || live_mode_changed) {
+      // Do not show a frame retained from a different deck or rendering mode.
+      context->live_held_frame_valid = false;
+      context->live_fallback_reported = false;
+    }
   }
   context->osc_feedback_enabled = osc_feedback_enabled;
   context->osc_feedback_host = (osc_feedback_host && *osc_feedback_host) ? osc_feedback_host : "127.0.0.1";
@@ -3370,15 +3379,26 @@ void source_destroy_texture(SourceContext *context)
   }
 
   std::lock_guard<std::mutex> lock(context->render_state_mutex);
-  if (!context->texture) {
+  if (!context->texture && !context->live_held_frame && !context->live_staging_frame) {
     return;
   }
   obs_enter_graphics();
-  gs_texture_destroy(context->texture);
+  if (context->texture) {
+    gs_texture_destroy(context->texture);
+  }
+  if (context->live_held_frame) {
+    gs_texrender_destroy(context->live_held_frame);
+  }
+  if (context->live_staging_frame) {
+    gs_texrender_destroy(context->live_staging_frame);
+  }
   obs_leave_graphics();
   context->texture = nullptr;
   context->texture_width = 0;
   context->texture_height = 0;
+  context->live_held_frame = nullptr;
+  context->live_staging_frame = nullptr;
+  context->live_held_frame_valid = false;
 }
 
 void source_render(SourceContext *context, gs_effect_t *effect)
@@ -3388,6 +3408,82 @@ void source_render(SourceContext *context, gs_effect_t *effect)
   }
 
   std::lock_guard<std::mutex> lock(context->render_state_mutex);
+
+  // A temporary OBS Window Capture unhook must NOT reveal the exported
+  // PowerPoint first-slide cache in Program. Capture the live output to a
+  // double-buffered GPU texture and reuse the last successful live frame.
+  const bool live_mode_active = context->mode == ViewMode::Slide &&
+    context->use_live_powerpoint && context->document &&
+    context->document->IsLivePowerPointEnabled() &&
+    !context->live_capture_suppressed_after_stop &&
+    !context->document->IsBlackScreen();
+  if (live_mode_active) {
+    if (!context->live_held_frame) {
+      context->live_held_frame = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+    }
+    if (!context->live_staging_frame) {
+      context->live_staging_frame = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+    }
+
+    bool captured_new_frame = false;
+    if (context->document->IsLivePowerPointReady() && context->live_staging_frame &&
+        context->width > 0 && context->height > 0) {
+      gs_texrender_reset(context->live_staging_frame);
+      if (gs_texrender_begin(context->live_staging_frame, context->width, context->height)) {
+        struct vec4 clear_color = {};
+        gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
+        gs_ortho(0.0f, static_cast<float>(context->width),
+                 0.0f, static_cast<float>(context->height), -100.0f, 100.0f);
+        captured_new_frame = render_live_capture(context);
+        gs_texrender_end(context->live_staging_frame);
+      }
+    }
+    if (captured_new_frame) {
+      std::swap(context->live_held_frame, context->live_staging_frame);
+      context->live_held_frame_valid = true;
+      context->live_held_frame_at = std::chrono::steady_clock::now();
+      if (context->live_fallback_reported) {
+        blog(LOG_INFO, "[PPTBridge SK] Windows live capture resumed; ending last-frame hold");
+      }
+      context->live_fallback_reported = false;
+    }
+
+    if (context->live_held_frame_valid) {
+      if (!captured_new_frame && !context->live_fallback_reported) {
+        blog(LOG_WARNING,
+             "[PPTBridge SK] Windows live capture interrupted; holding last live frame instead of cached slide");
+        context->live_fallback_reported = true;
+      }
+      const auto frame_age = std::chrono::steady_clock::now() - context->live_held_frame_at;
+      if (frame_age <= std::chrono::milliseconds(2500)) {
+        gs_texture_t *held_texture = gs_texrender_get_texture(context->live_held_frame);
+        if (held_texture) {
+          gs_effect_t *draw_effect = effect ? effect : obs_get_base_effect(OBS_EFFECT_DEFAULT);
+          if (draw_effect) {
+            gs_eparam_t *image = gs_effect_get_param_by_name(draw_effect, "image");
+            if (image) {
+              gs_effect_set_texture(image, held_texture);
+              while (gs_effect_loop(draw_effect, "Draw")) {
+                gs_draw_sprite(held_texture, 0, context->width, context->height);
+              }
+              return;
+            }
+          }
+        }
+      }
+      // Long outage: reveal the scene underneath (normally black or a safe
+      // holding background), NOT an out-of-date title/first slide. Automatic
+      // recovery remains the existing watchdog's responsibility.
+      return;
+    }
+  } else if (context->document && context->document->IsBlackScreen()) {
+    // Explicit blackout supersedes any retained live frame.
+    context->live_held_frame_valid = false;
+    context->live_fallback_reported = false;
+  }
+
+  // Cold start, manually stopped Live Mode, or unsupported GPU texture path:
+  // preserve original behavior until the first live capture frame is ready.
   if (render_live_capture(context)) {
     return;
   }

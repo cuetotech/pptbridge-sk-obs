@@ -2511,6 +2511,33 @@ bool with_active_document(SourceContext *context, const std::function<void(Prese
   return false;
 }
 
+void operator_capture_status(void *data, calldata_t *result)
+{
+  auto *context = static_cast<SourceContext *>(data);
+  if (!context || !result) return;
+  std::lock_guard<std::mutex> lock(context->render_state_mutex);
+  const char *status = "No presentation";
+  if (context->document) {
+    if (context->document->IsBlackScreen()) {
+      status = "BLACKOUT";
+    } else if (!context->use_live_powerpoint || !context->document->IsLivePowerPointEnabled()) {
+      status = "Cached slide mode";
+    } else if (context->live_held_frame_valid && context->live_fallback_reported) {
+      const auto age = std::chrono::steady_clock::now() - context->live_held_frame_at;
+      status = age <= std::chrono::milliseconds(2500)
+        ? "HOLDING previous live frame - capture interrupted"
+        : "Live capture unavailable - hold expired / recovery";
+    } else if (snapshot_live_child_status(context).capture_renderable) {
+      status = "Live capture attached (verify OBS Program)";
+    } else if (context->live_capture_suppressed_after_stop) {
+      status = "Live Mode stopped";
+    } else {
+      status = "Live capture not ready - cached startup / recovery";
+    }
+  }
+  calldata_set_string(result, "status", status);
+}
+
 bool control_previous(obs_properties_t *, obs_property_t *, void *data)
 {
   return with_active_document(static_cast<SourceContext *>(data), [](PresentationDocument &document) {
@@ -3471,9 +3498,17 @@ void source_render(SourceContext *context, gs_effect_t *effect)
           }
         }
       }
-      // Long outage: reveal the scene underneath (normally black or a safe
-      // holding background), NOT an out-of-date title/first slide. Automatic
-      // recovery remains the existing watchdog's responsibility.
+      // Long outage: draw an opaque safety frame, never reveal unrelated
+      // sources below the presentation. The existing watchdog owns recovery.
+      gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+      if (solid) {
+        struct vec4 black = {};
+        black.w = 1.0f;
+        gs_effect_set_vec4(gs_effect_get_param_by_name(solid, "color"), &black);
+        while (gs_effect_loop(solid, "Solid")) {
+          gs_draw_sprite(nullptr, 0, context->width, context->height);
+        }
+      }
       return;
     }
   } else if (context->document && context->document->IsBlackScreen()) {
@@ -3535,6 +3570,9 @@ static void *slide_source_create(obs_data_t *settings, obs_source_t *source)
   context->source = source;
   context->mode = ViewMode::Slide;
   source_update(context, settings);
+  proc_handler_add(obs_source_get_proc_handler(source),
+                   "void pptbridge_operator_status(out string status)",
+                   operator_capture_status, context);
   return context;
 }
 

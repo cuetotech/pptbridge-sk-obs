@@ -6,6 +6,7 @@
 #include <QListWidget>
 #include <QPushButton>
 #include <QImage>
+#include <QPainter>
 #include <QTemporaryDir>
 #include <QThread>
 #include <iostream>
@@ -47,6 +48,12 @@ int main(int argc, char **argv)
     QTemporaryDir assets;
     QImage image(640, 360, QImage::Format_RGB32);
     image.fill(Qt::darkBlue);
+    {
+      QPainter painter(&image);
+      painter.setPen(Qt::white);
+      QFont font = painter.font(); font.setPointSize(24); painter.setFont(font);
+      painter.drawText(image.rect(), Qt::AlignCenter, "Slide preview\nTest fixture - not PowerPoint");
+    }
     const auto path = assets.path() + "/slide.png";
     require(image.save(path), "thumbnail fixture");
     auto fake = std::make_unique<Fake>();
@@ -102,6 +109,10 @@ int main(int argc, char **argv)
     require(next->isEnabled(), "ready live mode enables navigation");
     // Let the real background thumbnail pipeline run before destruction.
     for (int i = 0; i < 15; ++i) { app.processEvents(); QThread::msleep(25); }
+    require(grid->visualItemRect(grid->item(0)).height() >= 130,
+            "thumbnail cell preserves readable image and caption height");
+    require(!grid->item(0)->icon().isNull(), "visible thumbnail decoded and installed");
+    require(grid->item(0)->text().contains("Verse one"), "thumbnail caption retained");
     require(panel.grab().save("operator-panel-smoke.png"), "Qt panel screenshot saved");
     backend->missing = true;
     for (int i = 0; i < 5; ++i) panel.Refresh();

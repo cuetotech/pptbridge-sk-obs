@@ -12,6 +12,7 @@
 #include <QPushButton>
 #include <QRunnable>
 #include <QSignalBlocker>
+#include <QScrollArea>
 #include <QSplitter>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -77,13 +78,18 @@ OperatorPanel::OperatorPanel(std::unique_ptr<OperatorBackend> backend, QWidget *
   grid_->setMovement(QListView::Static);
   grid_->setSelectionMode(QAbstractItemView::SingleSelection);
   grid_->setIconSize(QSize(160, 90));
-  grid_->setGridSize(QSize(184, 136));
+  grid_->setGridSize(QSize(184, 148));
   grid_->setWordWrap(true);
   grid_->setUniformItemSizes(true);
-  grid_->setMinimumHeight(140);
+  grid_->setMinimumHeight(180);
   browser_layout->addWidget(grid_);
 
-  auto *previews = new QWidget(splitter);
+  auto *previews = new QWidget;
+  auto *preview_scroll = new QScrollArea(splitter);
+  preview_scroll->setWidgetResizable(true);
+  preview_scroll->setFrameShape(QFrame::NoFrame);
+  preview_scroll->setMinimumHeight(160);
+  preview_scroll->setWidget(previews);
   auto *preview_layout = new QGridLayout(previews);
   current_text_ = TextLabel("currentText", previews);
   next_text_ = TextLabel("nextText", previews);
@@ -104,7 +110,8 @@ OperatorPanel::OperatorPanel(std::unique_ptr<OperatorBackend> backend, QWidget *
   preview_layout->addWidget(selected_image_, 3, 0, 1, 2);
   preview_layout->addWidget(notes_, 4, 0, 1, 2);
   splitter->addWidget(browser);
-  splitter->addWidget(previews);
+  splitter->addWidget(preview_scroll);
+  splitter->setChildrenCollapsible(false);
   splitter->setStretchFactor(0, 3);
   splitter->setStretchFactor(1, 2);
   layout->addWidget(splitter, 1);
@@ -212,6 +219,9 @@ void OperatorPanel::Refresh()
     grid_->clear();
     for (std::size_t i = 0; i < deck_.slides.size(); ++i) {
       auto *item = new QListWidgetItem(grid_);
+      // Fix the delegate's cell size before asynchronous icons arrive. An
+      // initially empty item otherwise caches a short, clipped icon row.
+      item->setSizeHint(QSize(180, 140));
       item->setToolTip(Utf8(deck_.slides[i].title));
     }
     if (auto selected = selection_.Selected()) grid_->setCurrentRow(int(*selected));
@@ -362,7 +372,9 @@ void OperatorPanel::PumpThumbnails()
     if (!item->isHidden() && grid_->visualItemRect(item).intersects(grid_->viewport()->rect())) {
       visible.insert(i);
       RequestImage(i);
-      if (auto *image = images_.object(i)) item->setIcon(QIcon(*image));
+      if (item->icon().isNull()) {
+        if (auto *image = images_.object(i)) item->setIcon(QIcon(*image));
+      }
     }
   }
   // QListWidget icons hold shared pixmaps: release offscreen icons as well as

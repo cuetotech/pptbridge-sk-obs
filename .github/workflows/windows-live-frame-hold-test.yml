@@ -1,0 +1,175 @@
+name: Windows PPTBridge Live Frame Hold - Test Installer
+
+on:
+  push:
+    branches:
+      - ci/windows-live-frame-hold-build
+      - fix/windows-live-frame-hold
+    paths:
+      - .github/workflows/windows-live-frame-hold-test.yml
+      - native-plugin/src/**
+      - native-plugin/cmake/**
+      - native-plugin/CMakeLists.txt
+      - native-plugin/scripts/make-windows-release.ps1
+      - native-plugin/windows-package/**
+      - native-plugin/data/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-live-frame-hold-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows-x64:
+    name: Build Windows x64 and package test installer
+    runs-on: windows-2022
+    timeout-minutes: 50
+    env:
+      OBS_VERSION: 32.2.2
+      PACKAGE_NAME: pptbridge-obs-windows-x64-live-frame-hold-test
+
+    steps:
+      - name: Checkout patched fork
+        uses: actions/checkout@v4
+
+      - name: Download official OBS Windows x64 portable build and matching headers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $obsVersion = $env:OBS_VERSION
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\obs-sdk" | Out-Null
+          $zipPath = Join-Path $env:RUNNER_TEMP "OBS-Studio-$obsVersion-Windows-x64.zip"
+          $url = "https://github.com/obsproject/obs-studio/releases/download/$obsVersion/OBS-Studio-$obsVersion-Windows-x64.zip"
+          & curl.exe -fL --retry 3 --retry-delay 5 --output $zipPath $url
+          if ($LASTEXITCODE -ne 0) { throw "OBS download failed ($LASTEXITCODE)" }
+          $extractDir = Join-Path $env:RUNNER_TEMP 'obs-portable'
+          Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
+          $obsDll = Get-ChildItem -LiteralPath $extractDir -Filter obs.dll -File -Recurse |
+            Where-Object { $_.FullName -match '[\\/]bin[\\/]64bit[\\/]obs[.]dll$' } |
+            Select-Object -First 1
+          if (-not $obsDll) { throw "OBS portable archive has no bin/64bit/obs.dll" }
+          $obsBin = $obsDll.Directory.FullName
+          if (-not (Test-Path (Join-Path $obsBin 'obs-frontend-api.dll'))) {
+            throw 'OBS portable archive lacks obs-frontend-api.dll'
+          }
+          $obsRoot = Split-Path -Parent (Split-Path -Parent $obsBin)
+          "OBS_APP_DIR=$obsRoot" >> $env:GITHUB_ENV
+          $src = Join-Path $env:RUNNER_TEMP 'obs-sdk\obs-studio'
+          & git clone --depth 1 --branch $obsVersion --filter=blob:none --sparse https://github.com/obsproject/obs-studio.git $src
+          if ($LASTEXITCODE -ne 0) { throw "OBS SDK checkout failed ($LASTEXITCODE)" }
+          & git -C $src sparse-checkout set libobs frontend/api
+          if ($LASTEXITCODE -ne 0) { throw 'OBS sparse checkout failed' }
+          if (-not (Test-Path (Join-Path $src 'libobs\obsconfig.h.in'))) {
+            throw 'OBS SDK missing libobs/obsconfig.h.in'
+          }
+          if (-not (Test-Path (Join-Path $src 'frontend\api\obs-frontend-api.h'))) {
+            throw 'OBS SDK missing frontend/api/obs-frontend-api.h'
+          }
+          "OBS_SOURCE_DIR=$src" >> $env:GITHUB_ENV
+          Write-Host "OBS Windows executable tree: $obsRoot"
+          Write-Host "Matching SDK source: $src"
+
+      - name: Generate MSVC import libraries from official OBS DLL exports
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path -LiteralPath $vswhere)) { throw 'vswhere.exe missing on Windows runner' }
+          $vs = & $vswhere -latest -products '*' -property installationPath
+          $toolDir = Get-ChildItem (Join-Path $vs 'VC\Tools\MSVC') -Directory |
+            Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $toolDir) { throw 'MSVC tool directory not found' }
+          $dumpbin = Join-Path $toolDir.FullName 'bin\Hostx64\x64\dumpbin.exe'
+          $lib = Join-Path $toolDir.FullName 'bin\Hostx64\x64\lib.exe'
+          if (-not (Test-Path $dumpbin) -or -not (Test-Path $lib)) {
+            throw 'MSVC dumpbin.exe or lib.exe unavailable'
+          }
+          $out = Join-Path $env:OBS_APP_DIR 'lib'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          foreach ($name in @('obs', 'obs-frontend-api')) {
+            $dll = Join-Path $env:OBS_APP_DIR "bin\64bit\$name.dll"
+            $exports = & $dumpbin /exports $dll
+            if ($LASTEXITCODE -ne 0) { throw "dumpbin failed for $dll" }
+            $symbols = @($exports | ForEach-Object {
+              if ($_ -match '^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]{8}\s+(\S+)') { $Matches[1] }
+            } | Where-Object { $_ -and $_ -ne '[NONAME]' } | Sort-Object -Unique)
+            if ($symbols.Count -lt 10) { throw "Too few exports in $name.dll: $($symbols.Count)" }
+            $def = Join-Path $out "$name.def"
+            @("LIBRARY $name.dll", 'EXPORTS') + $symbols | Set-Content -LiteralPath $def -Encoding ascii
+            $libPath = Join-Path $out "$name.lib"
+            & $lib /nologo "/def:$def" /machine:x64 "/out:$libPath"
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path $libPath)) {
+              throw "Generating $name.lib failed"
+            }
+            Write-Host "$name.lib created with $($symbols.Count) symbols"
+          }
+          "OBS_LIBRARY_DIR=$out" >> $env:GITHUB_ENV
+
+      - name: Configure and compile native plugin with Visual Studio
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & cmake -S native-plugin -B native-plugin/build-win-ci -G 'Visual Studio 17 2022' -A x64 "-DOBS_SOURCE_DIR=$env:OBS_SOURCE_DIR" "-DOBS_APP_DIR=$env:OBS_APP_DIR" "-DOBS_LIBRARY_DIR=$env:OBS_LIBRARY_DIR"
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed' }
+          & cmake --build native-plugin/build-win-ci --config Release --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw 'Windows plugin compile/link failed' }
+
+      - name: Package 5-file OBS installer ZIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $readme = 'native-plugin/windows-package/README.txt'
+          $original = Get-Content -LiteralPath $readme -Raw
+          $warning = @'
+          EXPERIMENTAL WINDOWS LIVE FRAME HOLD BUILD - NOT THE OFFICIAL RELEASE
+          Built automatically from cuetotech/pptbridge-sk-obs. Test privately before
+          replacing any OBS setup used for a live service. Back up the existing plugin.
+          This build is unsigned and has not been validated with Microsoft PowerPoint
+          on the church workstation.
+          
+          '@
+          Set-Content -LiteralPath $readme -Value ($warning + $original) -Encoding utf8
+          & pwsh -NoProfile -File native-plugin/scripts/make-windows-release.ps1 -Configuration Release -BuildDir native-plugin/build-win-ci -OutputDir native-plugin/release -PackageName $env:PACKAGE_NAME
+          if ($LASTEXITCODE -ne 0) { throw 'Windows packaging failed' }
+          $zip = Join-Path 'native-plugin/release' "$env:PACKAGE_NAME.zip"
+          $dll = Join-Path 'native-plugin/release/staging' "$env:PACKAGE_NAME/obs-plugins/64bit/pptbridge-obs.dll"
+          if (-not (Test-Path $zip) -or -not (Test-Path $dll)) {
+            throw 'Packaged plugin DLL or ZIP is missing'
+          }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zipArchive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip).Path)
+          try {
+            $fileNames = @($zipArchive.Entries | Where-Object { $_.Name } | ForEach-Object FullName)
+          } finally {
+            $zipArchive.Dispose()
+          }
+          if ($fileNames.Count -ne 5 -or $fileNames -notcontains 'INSTALL.cmd') {
+            throw "Invalid install ZIP: $($fileNames -join ', ')"
+          }
+          $summary = "### Experimental Windows build complete`n"
+          $summary += "OBS SDK: $env:OBS_VERSION`n"
+          $summary += "Commit: ${{ github.sha }}`n"
+          $summary += "Artifact: `$env:PACKAGE_NAME` (extract and run INSTALL.cmd)`n"
+          $summary += "Windows PowerPoint runtime acceptance: NOT TESTED in CI.`n"
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload installable Windows plugin package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE_NAME }}
+          path: native-plugin/release/staging/${{ env.PACKAGE_NAME }}/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload ZIP and SHA-256 checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE_NAME }}-zip-sha256
+          path: |
+            native-plugin/release/${{ env.PACKAGE_NAME }}.zip
+            native-plugin/release/${{ env.PACKAGE_NAME }}.zip.sha256
+          if-no-files-found: error
+          retention-days: 30

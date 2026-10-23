@@ -36,7 +36,7 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A native-plugin
           if ! git diff --cached --quiet; then
-            git commit -m 'Windows: integrate operator dock, read-only assets and command-state guards'
+            git commit -m 'Windows: harden operator asset generations and command lifetime'
             git push origin HEAD:refs/heads/feat/windows-operator-dock
           fi
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -133,7 +133,10 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $env:PATH = "$env:QT_ROOT\bin;$env:OBS_APP_DIR\bin\64bit;$env:PATH"
           $env:QT_PLUGIN_PATH = "$env:QT_ROOT\plugins"
-          ctest --test-dir native-plugin/build-operator -C Release --output-on-failure
+          $env:QT_QPA_PLATFORM_PLUGIN_PATH = "$env:QT_ROOT\plugins\platforms"
+          Get-ChildItem "$env:QT_ROOT\plugins\platforms"
+          Get-ChildItem "$env:QT_ROOT\bin" -Filter Qt6*.dll | Select-Object Name
+          ctest --test-dir native-plugin/build-operator -C Release --output-on-failure --verbose
           if ($LASTEXITCODE -ne 0) { throw 'Operator tests failed' }
       - name: Package experimental installer and verify installation into a fixture
         shell: pwsh
@@ -155,7 +158,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Installer fixture failed' }
           $expected = (Get-FileHash "$stage\obs-plugins\64bit\pptbridge-obs.dll").Hash
           if ((Get-FileHash "$mock\obs-plugins\64bit\pptbridge-obs.dll").Hash -ne $expected) { throw 'Installed DLL hash mismatch' }
-          # A locked existing DLL must fail without modifying the working DLL.
           $lock = [IO.File]::Open("$mock\obs-plugins\64bit\pptbridge-obs.dll",'Open','Read','None')
           try {
             & "$stage\INSTALL.cmd" $mock --no-pause
@@ -163,6 +165,7 @@ jobs:
           } finally { $lock.Dispose() }
           if ($lockedExit -eq 0) { throw 'Installer did not fail on a locked DLL' }
           if ((Get-FileHash "$mock\obs-plugins\64bit\pptbridge-obs.dll").Hash -ne $expected) { throw 'Locked-install rollback changed DLL' }
+          $global:LASTEXITCODE = 0
           New-Item -ItemType Directory -Force artifacts | Out-Null
           $zip = Join-Path (Resolve-Path artifacts) "$env:PACKAGE_NAME.zip"
           Compress-Archive -Path "$stage\*" -DestinationPath $zip

@@ -139,7 +139,13 @@ jobs:
           if (-not (Test-Path $zip) -or -not (Test-Path $dll)) {
             throw 'Packaged plugin DLL or ZIP is missing'
           }
-          $fileNames = @([IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip).Path).Entries | ForEach-Object FullName)
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zipArchive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $zip).Path)
+          try {
+            $fileNames = @($zipArchive.Entries | Where-Object { $_.Name } | ForEach-Object FullName)
+          } finally {
+            $zipArchive.Dispose()
+          }
           if ($fileNames.Count -ne 5 -or $fileNames -notcontains 'INSTALL.cmd') {
             throw "Invalid install ZIP: $($fileNames -join ', ')"
           }

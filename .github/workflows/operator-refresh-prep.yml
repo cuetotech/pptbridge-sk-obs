@@ -1,0 +1,43 @@
+name: Operator refresh patch preparation
+on:
+  push:
+    branches: [fix/windows-operator-refresh]
+    paths:
+      - .github/workflows/operator-refresh-prep.yml
+      - native-plugin/scripts/apply-observed-fix.py
+permissions:
+  contents: read
+jobs:
+  prepare:
+    if: github.repository == 'cuetotech/pptbridge-sk-obs' && github.ref == 'refs/heads/fix/windows-operator-refresh'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Apply anchor-checked source patch when present
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f native-plugin/scripts/apply-observed-fix.py ]; then
+            python3 native-plugin/scripts/apply-observed-fix.py
+            git diff --check
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add native-plugin .github/workflows/windows-operator-dock.yml
+            if ! git diff --cached --quiet; then
+              git commit -m 'Windows: fix non-destructive capture recovery and compact operator browsing'
+              git push origin HEAD:refs/heads/fix/windows-operator-refresh
+            fi
+          fi
+          git rev-parse HEAD > SOURCE-COMMIT.txt
+          git archive --format=zip --output=source-review.zip HEAD
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: operator-refresh-source-review
+          path: |
+            source-review.zip
+            SOURCE-COMMIT.txt
+          retention-days: 7
+          if-no-files-found: error

@@ -1,0 +1,179 @@
+name: Observed refresh correction - Windows candidate
+on:
+  push:
+    branches: [fix/windows-operator-refresh]
+    paths:
+      - '.github/workflows/apply-observed-refresh-fix.yml'
+      - 'native-plugin/scripts/apply-observed-fix.py'
+permissions:
+  contents: read
+concurrency:
+  group: observed-refresh-candidate-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  integrate:
+    if: github.repository == 'cuetotech/pptbridge-sk-obs'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Apply integrity-checked source correction
+        run: |
+          set -euo pipefail
+          test -f native-plugin/scripts/apply-observed-fix.py
+          python3 native-plugin/scripts/apply-observed-fix.py
+          g++ -std=c++17 -Wall -Wextra -Werror -pthread -I native-plugin/src native-plugin/tests/operator_model_test.cpp -o /tmp/operator-model
+          /tmp/operator-model
+          g++ -std=c++17 -Wall -Wextra -Werror -pthread -I native-plugin/src native-plugin/tests/live_snapshot_parser_test.cpp -o /tmp/live-parser
+          /tmp/live-parser
+          git diff --check
+      - name: Commit corrected source before Windows compilation
+        id: commit
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add native-plugin .github/workflows/windows-operator-dock.yml
+          if ! git diff --cached --quiet; then
+            git commit -m 'Windows: repair timed live recovery and preserve operator browse position'
+            git push origin HEAD:refs/heads/fix/windows-operator-refresh
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+  windows:
+    needs: integrate
+    runs-on: windows-2022
+    timeout-minutes: 40
+    env:
+      OBS_VERSION: 32.2.2
+      SOURCE_SHA: ${{ needs.integrate.outputs.sha }}
+      PACKAGE_NAME: pptbridge-operator-refresh-windows-x64-test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.integrate.outputs.sha }}
+          persist-credentials: false
+      - name: Prepare official OBS and matching Qt SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ((git rev-parse HEAD) -ne $env:SOURCE_SHA) { throw 'Source revision mismatch' }
+          $zip = Join-Path $env:RUNNER_TEMP 'obs.zip'
+          curl.exe -fL --retry 3 -o $zip "https://github.com/obsproject/obs-studio/releases/download/$env:OBS_VERSION/OBS-Studio-$env:OBS_VERSION-Windows-x64.zip"
+          if ($LASTEXITCODE -ne 0) { throw 'OBS download failed' }
+          $dest = Join-Path $env:RUNNER_TEMP 'obs'
+          Expand-Archive -LiteralPath $zip -DestinationPath $dest
+          $dll = Get-ChildItem $dest -Filter obs.dll -Recurse | Where-Object { $_.FullName -match '[\\/]bin[\\/]64bit[\\/]' } | Select-Object -First 1
+          if (-not $dll) { throw 'OBS DLL missing' }
+          $obsRoot = Split-Path -Parent (Split-Path -Parent $dll.Directory.FullName)
+          "OBS_APP_DIR=$obsRoot" >> $env:GITHUB_ENV
+          $src = Join-Path $env:RUNNER_TEMP 'obs-headers'
+          git clone --depth 1 --branch $env:OBS_VERSION --filter=blob:none --sparse https://github.com/obsproject/obs-studio.git $src
+          if ($LASTEXITCODE -ne 0) { throw 'OBS headers checkout failed' }
+          git -C $src sparse-checkout set libobs frontend/api
+          if ($LASTEXITCODE -ne 0) { throw 'OBS sparse checkout failed' }
+          "OBS_SOURCE_DIR=$src" >> $env:GITHUB_ENV
+          $qtZip = Join-Path $env:RUNNER_TEMP 'qt.zip'
+          curl.exe -fL --retry 3 -o $qtZip 'https://github.com/obsproject/obs-deps/releases/download/2026-07-15/windows-deps-qt6-2026-07-15-x64.zip'
+          if ($LASTEXITCODE -ne 0) { throw 'Qt SDK download failed' }
+          if ((Get-FileHash $qtZip -Algorithm SHA256).Hash.ToLowerInvariant() -ne '7c7f985711d80467bdc1795b6592275a27d5b0e5a2c7a61db1f2c1d08d6a5579') { throw 'Qt SDK checksum mismatch' }
+          $qtDir = Join-Path $env:RUNNER_TEMP 'qt-sdk'
+          Expand-Archive -LiteralPath $qtZip -DestinationPath $qtDir
+          $config = Get-ChildItem $qtDir -Recurse -Filter Qt6Config.cmake | Select-Object -First 1
+          if (-not $config) { throw 'Qt config missing' }
+          $qtRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $config.Directory.FullName))
+          "QT_ROOT=$qtRoot" >> $env:GITHUB_ENV
+          "QT_CONFIG=$($config.Directory.FullName)" >> $env:GITHUB_ENV
+      - name: Generate OBS import libraries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -property installationPath
+          $toolDir = Get-ChildItem (Join-Path $vs 'VC\Tools\MSVC') -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          $dumpbin = Join-Path $toolDir.FullName 'bin\Hostx64\x64\dumpbin.exe'
+          $lib = Join-Path $toolDir.FullName 'bin\Hostx64\x64\lib.exe'
+          $out = Join-Path $env:OBS_APP_DIR 'lib'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          foreach ($name in @('obs','obs-frontend-api')) {
+            $exports = & $dumpbin /exports (Join-Path $env:OBS_APP_DIR "bin\64bit\$name.dll")
+            if ($LASTEXITCODE -ne 0) { throw "Export inspection failed: $name" }
+            $symbols = @($exports | ForEach-Object { if ($_ -match '^\s*\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]{8}\s+(\S+)') { $Matches[1] } } | Sort-Object -Unique)
+            if ($symbols.Count -lt 10) { throw 'Invalid OBS exports' }
+            $def = Join-Path $out "$name.def"
+            @("LIBRARY $name.dll",'EXPORTS') + $symbols | Set-Content $def -Encoding ascii
+            & $lib /nologo "/def:$def" /machine:x64 "/out:$out\$name.lib"
+            if ($LASTEXITCODE -ne 0) { throw 'Import library failed' }
+          }
+          "OBS_LIBRARY_DIR=$out" >> $env:GITHUB_ENV
+      - name: Compile corrected Windows plugin and tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S native-plugin -B native-plugin/build-operator -G 'Visual Studio 17 2022' -A x64 "-DOBS_SOURCE_DIR=$env:OBS_SOURCE_DIR" "-DOBS_APP_DIR=$env:OBS_APP_DIR" "-DOBS_LIBRARY_DIR=$env:OBS_LIBRARY_DIR" "-DCMAKE_PREFIX_PATH=$env:QT_ROOT" "-DQt6_DIR=$env:QT_CONFIG" "-DPPTBRIDGE_BUILD_ID=$env:SOURCE_SHA" -DBUILD_TESTING=ON
+          if ($LASTEXITCODE -ne 0) { throw 'Configure failed' }
+          cmake --build native-plugin/build-operator --config Release --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw 'Compile failed' }
+      - name: Test scrolling, private selection and live-status parser
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PATH = "$env:QT_ROOT\bin;$env:OBS_APP_DIR\bin\64bit;$env:PATH"
+          $env:QT_PLUGIN_PATH = "$env:QT_ROOT\plugins"
+          $env:QT_QPA_PLATFORM_PLUGIN_PATH = "$env:QT_ROOT\plugins\platforms"
+          ctest --test-dir native-plugin/build-operator -C Release --output-on-failure --verbose
+          if ($LASTEXITCODE -ne 0) { throw 'Regression tests failed' }
+      - name: Package candidate and verify installer fixture
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = Join-Path $env:RUNNER_TEMP $env:PACKAGE_NAME
+          New-Item -ItemType Directory -Force "$stage\obs-plugins\64bit","$stage\data\obs-plugins\pptbridge-obs" | Out-Null
+          Copy-Item native-plugin/build-operator/bundle/Release/pptbridge-obs.dll "$stage\obs-plugins\64bit\pptbridge-obs.dll"
+          Copy-Item native-plugin/windows-package/INSTALL.cmd "$stage\INSTALL.cmd"
+          Get-ChildItem native-plugin/data | Copy-Item -Destination "$stage\data\obs-plugins\pptbridge-obs" -Recurse
+          Copy-Item native-plugin/OPERATOR-DOCK.md "$stage\README.txt"
+          $license = if (Test-Path native-plugin/LICENSE) { 'native-plugin/LICENSE' } else { 'LICENSE' }
+          Copy-Item $license "$stage\LICENSE.txt"
+          @('EXPERIMENTAL Windows operator refresh correction', "Source: $env:SOURCE_SHA", "OBS SDK: $env:OBS_VERSION", 'Real OBS/PowerPoint workstation acceptance: NOT PERFORMED in CI') | Set-Content "$stage\BUILD-INFO.txt"
+          $fixture = Join-Path $env:RUNNER_TEMP 'installer-fixture'
+          New-Item -ItemType Directory -Force "$fixture\bin\64bit","$fixture\obs-plugins\64bit" | Out-Null
+          Set-Content "$fixture\bin\64bit\obs64.exe" 'fixture only'
+          Set-Content "$fixture\obs-plugins\64bit\pptbridge-obs.dll" 'previous fixture'
+          & "$stage\INSTALL.cmd" $fixture --no-pause
+          if ($LASTEXITCODE -ne 0) { throw 'Installer fixture failed' }
+          $expected = (Get-FileHash "$stage\obs-plugins\64bit\pptbridge-obs.dll").Hash
+          if ((Get-FileHash "$fixture\obs-plugins\64bit\pptbridge-obs.dll").Hash -ne $expected) { throw 'Installed DLL mismatch' }
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          $zip = Join-Path (Resolve-Path artifacts) "$env:PACKAGE_NAME.zip"
+          Compress-Archive -Path "$stage\*" -DestinationPath $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $env:PACKAGE_NAME.zip" | Set-Content "$zip.sha256" -Encoding ascii
+          "PACKAGE_DIR=$stage" >> $env:GITHUB_ENV
+          @('## Refresh correction candidate', "Built source: $env:SOURCE_SHA", 'Windows build, regression tests and installer fixture passed. Real PowerPoint rehearsal remains required.') >> $env:GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pptbridge-operator-refresh-windows-x64-test
+          path: ${{ env.PACKAGE_DIR }}/
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pptbridge-operator-refresh-zip-sha256
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pptbridge-refresh-test-evidence
+          path: |
+            native-plugin/build-operator/Testing/Temporary/LastTest.log
+            native-plugin/build-operator/operator-panel-smoke.png
+          if-no-files-found: warn
+          retention-days: 30

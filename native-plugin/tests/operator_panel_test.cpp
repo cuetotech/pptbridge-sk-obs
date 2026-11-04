@@ -5,6 +5,7 @@
 #include <QLineEdit>
 #include <QListWidget>
 #include <QPushButton>
+#include <QScrollBar>
 #include <QImage>
 #include <QPainter>
 #include <QTemporaryDir>
@@ -113,6 +114,22 @@ int main(int argc, char **argv)
             "thumbnail cell preserves readable image and caption height");
     require(!grid->item(0)->icon().isNull(), "visible thumbnail decoded and installed");
     require(grid->item(0)->text().contains("Verse one"), "thumbnail caption retained");
+    // The live status poll must not scroll the browser back to the active slide.
+    backend->deck.identity = "a:scroll";
+    backend->deck.slides.resize(80, backend->deck.slides.front());
+    panel.Refresh();
+    app.processEvents();
+    auto *scroll = grid->verticalScrollBar();
+    require(scroll->maximum() > 0, "long deck has a scrollable browser");
+    scroll->setValue(std::min(scroll->maximum(), 300));
+    const int browsing_position = scroll->value();
+    require(browsing_position > 0, "operator can scroll away from the active slide");
+    for (int i = 0; i < 8; ++i) {
+      backend->deck.capture_status = "Live capture poll " + std::to_string(i);
+      panel.Refresh();
+      app.processEvents();
+    }
+    require(scroll->value() == browsing_position, "poll preserves private browse scroll");
     require(panel.grab().save("operator-panel-smoke.png"), "Qt panel screenshot saved");
     backend->missing = true;
     for (int i = 0; i < 5; ++i) panel.Refresh();

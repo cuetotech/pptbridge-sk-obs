@@ -1,4 +1,5 @@
 #include "presentation_document.hpp"
+#include "live_snapshot_validation.hpp"
 #include "windows_pdf_renderer.hpp"
 
 #ifdef _WIN32
@@ -2146,6 +2147,9 @@ bool ParseLiveSnapshot(const std::string &output, LiveSnapshot &snapshot, std::s
 {
   snapshot = {};
   bool ok = false;
+  bool saw_running = false;
+  bool saw_slide = false;
+  bool saw_count = false;
   for (const auto &line : SplitLines(output)) {
     if (line == "OK") {
       ok = true;
@@ -2153,12 +2157,19 @@ bool ParseLiveSnapshot(const std::string &output, LiveSnapshot &snapshot, std::s
     }
 
     if (line.rfind("RUNNING|", 0) == 0) {
-      snapshot.running = line.substr(8) == "1";
+      const auto state = line.substr(8);
+      if (state != "0" && state != "1") {
+        out_error = "Invalid PowerPoint running status";
+        return false;
+      }
+      saw_running = true;
+      snapshot.running = state == "1";
       continue;
     }
     if (line.rfind("SLIDE|", 0) == 0) {
       try {
         snapshot.current_slide = static_cast<size_t>(std::max(0, std::stoi(line.substr(6))));
+        saw_slide = true;
       } catch (...) {
       }
       continue;
@@ -2166,6 +2177,7 @@ bool ParseLiveSnapshot(const std::string &output, LiveSnapshot &snapshot, std::s
     if (line.rfind("COUNT|", 0) == 0) {
       try {
         snapshot.slide_count = static_cast<size_t>(std::max(0, std::stoi(line.substr(6))));
+        saw_count = true;
       } catch (...) {
       }
       continue;
@@ -2222,6 +2234,11 @@ bool ParseLiveSnapshot(const std::string &output, LiveSnapshot &snapshot, std::s
 
   if (!ok) {
     out_error = output.empty() ? "PowerPoint live command did not return a valid response." : output;
+    return false;
+  }
+  if (!LiveSnapshotFieldsValid(snapshot.running, saw_running, saw_slide, saw_count,
+                               snapshot.current_slide, snapshot.slide_count)) {
+    out_error = "PowerPoint live response is incomplete or has an invalid slide position";
     return false;
   }
 
@@ -2684,6 +2701,7 @@ struct PresentationDocument::Impl {
   std::chrono::steady_clock::time_point timer_started_at = std::chrono::steady_clock::time_point::min();
   std::chrono::steady_clock::time_point live_last_sync = std::chrono::steady_clock::time_point::min();
   bool live_sync_inflight = false;
+  std::chrono::steady_clock::time_point live_snapshot_failure_since = std::chrono::steady_clock::time_point::min();
 };
 
 PresentationDocument::PresentationDocument(std::string pptx_path)
@@ -2997,6 +3015,7 @@ void PresentationDocument::SyncLiveStateAsync()
     }
 
     if (parsed && snapshot.running) {
+      self->impl_->live_snapshot_failure_since = std::chrono::steady_clock::time_point::min();
       bool changed = false;
       if (self->impl_->live_ready != snapshot.running) {
         self->impl_->live_ready = snapshot.running;
@@ -3035,6 +3054,12 @@ void PresentationDocument::SyncLiveStateAsync()
         self->impl_->state_version += 1;
       }
     } else {
+      if (!parsed && HoldPreviousLiveSnapshot(
+          self->impl_->live_ready, self->impl_->live_snapshot_failure_since,
+          std::chrono::steady_clock::now(), std::chrono::milliseconds(2500))) {
+        return; // A single transient PowerPoint poll must not clear the live frame.
+      }
+      self->impl_->live_snapshot_failure_since = std::chrono::steady_clock::time_point::min();
       const std::string detail = parsed && !snapshot.running
         ? "The PowerPoint slideshow was closed."
         : (!error.empty() ? error : output);

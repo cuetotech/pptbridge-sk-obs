@@ -13,6 +13,7 @@
 #include <QRunnable>
 #include <QSignalBlocker>
 #include <QScrollArea>
+#include <QScrollBar>
 #include <QSplitter>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -206,6 +207,8 @@ void OperatorPanel::Refresh()
   auto updated = id.empty() ? OperatorDeck{} : backend_->Read(id);
   const bool reset = selection_.Observe(updated.identity, updated.slides.size(), updated.current);
   deck_ = std::move(updated);
+  // Polling must not steal the scroll position from the operator while browsing.
+  const int browser_scroll = grid_->verticalScrollBar()->value();
   if (reset) {
     ++image_generation_;
     workers_.clear();
@@ -232,11 +235,17 @@ void OperatorPanel::Refresh()
     const auto &slide = deck_.slides[std::size_t(i)];
     QString prefix = std::size_t(i) == deck_.current ? "NOW | " :
                      std::size_t(i) == deck_.current + 1 ? "NEXT | " : "";
-    grid_->item(i)->setText(prefix + QString::number(i + 1) + ". " + Utf8(slide.title));
-    QFont font = grid_->font();
-    font.setBold(std::size_t(i) == deck_.current);
-    grid_->item(i)->setFont(font);
+    const QString label = prefix + QString::number(i + 1) + ". " + Utf8(slide.title);
+    auto *item = grid_->item(i);
+    if (item->text() != label) item->setText(label);
+    const bool current = std::size_t(i) == deck_.current;
+    if (item->font().bold() != current) {
+      QFont font = item->font();
+      font.setBold(current);
+      item->setFont(font);
+    }
   }
+  if (!reset) grid_->verticalScrollBar()->setValue(browser_scroll);
   path_->setText(Utf8(deck_.path));
   path_->setToolTip(Utf8(deck_.path));
   UpdateControls();

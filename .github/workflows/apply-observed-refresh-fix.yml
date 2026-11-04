@@ -4,7 +4,9 @@ on:
     branches: [fix/windows-operator-refresh]
     paths:
       - '.github/workflows/apply-observed-refresh-fix.yml'
-      - 'native-plugin/scripts/apply-observed-fix.py'
+      - 'native-plugin/src/**'
+      - 'native-plugin/tests/**'
+      - 'native-plugin/CMakeLists.txt'
 permissions:
   contents: read
 concurrency:
@@ -16,34 +18,24 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: write
+      contents: read
     outputs:
-      sha: ${{ steps.commit.outputs.sha }}
+      sha: ${{ steps.source.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
-      - name: Apply integrity-checked source correction
+          persist-credentials: false
+      - name: Verify committed source and run portable regression checks
+        id: source
         run: |
           set -euo pipefail
-          test -f native-plugin/scripts/apply-observed-fix.py
-          python3 native-plugin/scripts/apply-observed-fix.py
           g++ -std=c++17 -Wall -Wextra -Werror -pthread -I native-plugin/src native-plugin/tests/operator_model_test.cpp -o /tmp/operator-model
           /tmp/operator-model
           g++ -std=c++17 -Wall -Wextra -Werror -pthread -I native-plugin/src native-plugin/tests/live_snapshot_parser_test.cpp -o /tmp/live-parser
           /tmp/live-parser
           git diff --check
-      - name: Commit corrected source before Windows compilation
-        id: commit
-        run: |
-          set -euo pipefail
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add native-plugin .github/workflows/windows-operator-dock.yml
-          if ! git diff --cached --quiet; then
-            git commit -m 'Windows: repair timed live recovery and preserve operator browse position'
-            git push origin HEAD:refs/heads/fix/windows-operator-refresh
-          fi
+          test -z "$(git status --porcelain)"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
   windows:
     needs: integrate
